@@ -6,7 +6,7 @@
 constexpr uint8_t QOI_OP_INDEX_TAG = 0x00;
 constexpr uint8_t QOI_OP_DIFF_TAG  = 0x40;
 constexpr uint8_t QOI_OP_LUMA_TAG  = 0x80;
-constexpr uint8_t QOI_OP_RUN_TAG   = 0xc0; 
+constexpr uint8_t QOI_OP_RUN_TAG   = 0xc0;
 constexpr uint8_t QOI_OP_RGB_TAG   = 0xfe;
 constexpr uint8_t QOI_OP_RGBA_TAG  = 0xff;
 constexpr uint8_t QOI_PADDING[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u};
@@ -38,104 +38,159 @@ bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &co
 
 
 bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colorspace) {
+    constexpr uint64_t kMaxPixels = 400000000ull;
+    const uint64_t pixel_count = static_cast<uint64_t>(width) * height;
+    if (width == 0 || height == 0 || pixel_count > kMaxPixels ||
+        (channels != 3 && channels != 4) || colorspace > 1) {
+        return false;
+    }
 
-    // qoi-header part
-
-    // write magic bytes "qoif"
     QoiWriteChar('q');
     QoiWriteChar('o');
     QoiWriteChar('i');
     QoiWriteChar('f');
-    // write image width
     QoiWriteU32(width);
-    // write image height
     QoiWriteU32(height);
-    // write channel number
     QoiWriteU8(channels);
-    // write color space specifier
     QoiWriteU8(colorspace);
 
-    /* qoi-data part */
+    uint8_t index[64][4] = {};
+    uint8_t previous[4] = {0u, 0u, 0u, 255u};
+    uint8_t pixel[4];
     int run = 0;
-    int px_num = width * height;
 
-    uint8_t history[64][4];
-    memset(history, 0, sizeof(history));
+    for (uint64_t i = 0; i < pixel_count; ++i) {
+        pixel[0] = QoiReadU8();
+        pixel[1] = QoiReadU8();
+        pixel[2] = QoiReadU8();
+        pixel[3] = channels == 4 ? QoiReadU8() : 255u;
+        if (!std::cin.good()) return false;
 
-    uint8_t r, g, b, a;
-    a = 255u;
-    uint8_t pre_r, pre_g, pre_b, pre_a;
-    pre_r = 0u;
-    pre_g = 0u;
-    pre_b = 0u;
-    pre_a = 255u;
+        if (memcmp(pixel, previous, sizeof(pixel)) == 0) {
+            ++run;
+            if (run == 62 || i + 1 == pixel_count) {
+                QoiWriteU8(QOI_OP_RUN_TAG | static_cast<uint8_t>(run - 1));
+                run = 0;
+            }
+            continue;
+        }
 
-    for (int i = 0; i < px_num; ++i) {
-        r = QoiReadU8();
-        g = QoiReadU8();
-        b = QoiReadU8();
-        if (channels == 4) a = QoiReadU8();
+        if (run != 0) {
+            QoiWriteU8(QOI_OP_RUN_TAG | static_cast<uint8_t>(run - 1));
+            run = 0;
+        }
 
-        // TODO
+        const int hash = QoiColorHash(pixel[0], pixel[1], pixel[2], pixel[3]);
+        if (memcmp(pixel, index[hash], sizeof(pixel)) == 0) {
+            QoiWriteU8(QOI_OP_INDEX_TAG | static_cast<uint8_t>(hash));
+        } else {
+            memcpy(index[hash], pixel, sizeof(pixel));
+            // Match the assignment's reference encoder, which performs channel
+            // subtraction in uint8_t before choosing a differential opcode.
+            const uint8_t dr = pixel[0] - previous[0];
+            const uint8_t dg = pixel[1] - previous[1];
+            const uint8_t db = pixel[2] - previous[2];
 
-        pre_r = r;
-        pre_g = g;
-        pre_b = b;
-        pre_a = a;
+            if (pixel[3] == previous[3] && (dr <= 1u || dr >= 254u) &&
+                (dg <= 1u || dg >= 254u) && (db <= 1u || db >= 254u)) {
+                QoiWriteU8(QOI_OP_DIFF_TAG | static_cast<uint8_t>((dr + 2u) << 4) |
+                           static_cast<uint8_t>((dg + 2u) << 2) |
+                           static_cast<uint8_t>(db + 2u));
+            } else if (pixel[3] == previous[3] &&
+                       (dg <= 31u || dg >= 224u) &&
+                       (static_cast<uint8_t>(dr - dg) <= 7u ||
+                        static_cast<uint8_t>(dr - dg) >= 248u) &&
+                       (static_cast<uint8_t>(db - dg) <= 7u ||
+                        static_cast<uint8_t>(db - dg) >= 248u)) {
+                QoiWriteU8(QOI_OP_LUMA_TAG | static_cast<uint8_t>(dg + 32u));
+                QoiWriteU8(static_cast<uint8_t>((static_cast<uint8_t>(dr - dg) + 8u) << 4) |
+                           static_cast<uint8_t>(db - dg + 8u));
+            } else if (pixel[3] == previous[3]) {
+                QoiWriteU8(QOI_OP_RGB_TAG);
+                QoiWriteU8(pixel[0]);
+                QoiWriteU8(pixel[1]);
+                QoiWriteU8(pixel[2]);
+            } else {
+                QoiWriteU8(QOI_OP_RGBA_TAG);
+                QoiWriteU8(pixel[0]);
+                QoiWriteU8(pixel[1]);
+                QoiWriteU8(pixel[2]);
+                QoiWriteU8(pixel[3]);
+            }
+        }
+        memcpy(previous, pixel, sizeof(pixel));
     }
 
-    // qoi-padding part
-    for (int i = 0; i < sizeof(QOI_PADDING) / sizeof(QOI_PADDING[0]); ++i) {
-        QoiWriteU8(QOI_PADDING[i]);
-    }
-
-    return true;
+    for (uint8_t byte : QOI_PADDING) QoiWriteU8(byte);
+    return std::cout.good();
 }
 
 bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &colorspace) {
+    constexpr uint64_t kMaxPixels = 400000000ull;
+    const uint8_t magic[4] = {QoiReadU8(), QoiReadU8(), QoiReadU8(), QoiReadU8()};
+    if (!std::cin.good() || memcmp(magic, "qoif", sizeof(magic)) != 0) return false;
 
-    char c1 = QoiReadChar();
-    char c2 = QoiReadChar();
-    char c3 = QoiReadChar();
-    char c4 = QoiReadChar();
-    if (c1 != 'q' || c2 != 'o' || c3 != 'i' || c4 != 'f') {
+    width = QoiReadU32();
+    height = QoiReadU32();
+    channels = QoiReadU8();
+    colorspace = QoiReadU8();
+    const uint64_t pixel_count = static_cast<uint64_t>(width) * height;
+    if (!std::cin.good() || width == 0 || height == 0 || pixel_count > kMaxPixels ||
+        (channels != 3 && channels != 4) || colorspace > 1) {
         return false;
     }
 
-    // read image width
-    width = QoiReadU32();
-    // read image height
-    height = QoiReadU32();
-    // read channel number
-    channels = QoiReadU8();
-    // read color space specifier
-    colorspace = QoiReadU8();
-
+    uint8_t index[64][4] = {};
+    uint8_t pixel[4] = {0u, 0u, 0u, 255u};
     int run = 0;
-    int px_num = width * height;
 
-    uint8_t history[64][4];
-    memset(history, 0, sizeof(history));
+    for (uint64_t i = 0; i < pixel_count; ++i) {
+        if (run > 0) {
+            --run;
+        } else {
+            const uint8_t tag = QoiReadU8();
+            if (!std::cin.good()) return false;
 
-    uint8_t r, g, b, a;
-    a = 255u;
+            if (tag == QOI_OP_RGB_TAG) {
+                pixel[0] = QoiReadU8();
+                pixel[1] = QoiReadU8();
+                pixel[2] = QoiReadU8();
+            } else if (tag == QOI_OP_RGBA_TAG) {
+                pixel[0] = QoiReadU8();
+                pixel[1] = QoiReadU8();
+                pixel[2] = QoiReadU8();
+                pixel[3] = QoiReadU8();
+            } else if ((tag & QOI_MASK_2) == QOI_OP_INDEX_TAG) {
+                memcpy(pixel, index[tag], sizeof(pixel));
+            } else if ((tag & QOI_MASK_2) == QOI_OP_DIFF_TAG) {
+                pixel[0] = static_cast<uint8_t>(pixel[0] + ((tag >> 4 & 0x03) - 2));
+                pixel[1] = static_cast<uint8_t>(pixel[1] + ((tag >> 2 & 0x03) - 2));
+                pixel[2] = static_cast<uint8_t>(pixel[2] + ((tag & 0x03) - 2));
+            } else if ((tag & QOI_MASK_2) == QOI_OP_LUMA_TAG) {
+                const uint8_t adjustment = QoiReadU8();
+                if (!std::cin.good()) return false;
+                const int dg = (tag & 0x3f) - 32;
+                pixel[0] = static_cast<uint8_t>(pixel[0] + dg + ((adjustment >> 4) - 8));
+                pixel[1] = static_cast<uint8_t>(pixel[1] + dg);
+                pixel[2] = static_cast<uint8_t>(pixel[2] + dg + ((adjustment & 0x0f) - 8));
+            } else {
+                run = tag & 0x3f;
+                if (static_cast<uint64_t>(run) > pixel_count - i - 1) return false;
+            }
+            if (!std::cin.good()) return false;
+        }
 
-    for (int i = 0; i < px_num; ++i) {
-
-        // TODO
-
-        QoiWriteU8(r);
-        QoiWriteU8(g);
-        QoiWriteU8(b);
-        if (channels == 4) QoiWriteU8(a);
+        memcpy(index[QoiColorHash(pixel[0], pixel[1], pixel[2], pixel[3])], pixel, sizeof(pixel));
+        QoiWriteU8(pixel[0]);
+        QoiWriteU8(pixel[1]);
+        QoiWriteU8(pixel[2]);
+        if (channels == 4) QoiWriteU8(pixel[3]);
     }
 
-    bool valid = true;
-    for (int i = 0; i < sizeof(QOI_PADDING) / sizeof(QOI_PADDING[0]); ++i) {
-        if (QoiReadU8() != QOI_PADDING[i]) valid = false;
+    for (uint8_t expected : QOI_PADDING) {
+        if (QoiReadU8() != expected || !std::cin.good()) return false;
     }
-
-    return valid;
+    return std::cin.peek() == std::char_traits<char>::eof() && std::cout.good();
 }
 
 #endif // QOI_FORMAT_CODEC_QOI_H_
